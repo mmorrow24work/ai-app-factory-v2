@@ -204,7 +204,31 @@ the start instead of left to be rediscovered a second time.
   (`templates/custom-script/theme.css` + `theme-toggle.js`) exist from the first version of
   the relevant templates, rather than being adopted mid-build from a sibling project.
 
-## Architecture
+## Lessons learned standing up this repo itself
+
+Found during the actual first deploy of `ai-app-factory-v2` (not inherited from the
+predecessor — genuinely new):
+
+- **The local default branch name is not guaranteed to be `main`.** Every workflow here
+  hardcodes `main` (`pages-deploy.yml`'s `branches: [main]`, `base_branch: main` in
+  `claude.yml`/`draft-design-doc.yml`/`generate-issues.yml`), but a fresh `git init` only
+  defaults to `main` if `git config init.defaultBranch` is set that way — older git versions,
+  and plenty of default shell environments, still default to `master`. Verify with
+  `git branch` before the first push; rename with `git branch -m master main` if needed,
+  *before* pushing, so GitHub's default branch is `main` from the first commit rather than
+  needing a rename (and the environment-protection fix below) after the fact.
+- **GitHub's auto-created `github-pages` deployment environment locks deployment to whatever
+  the default branch was *at the time Pages was first configured*, and does not auto-update
+  if the default branch is renamed afterward.** Renaming `master` → `main` post-hoc left the
+  environment's "Deployment branches and tags" rule still pointed at `master`, so every deploy
+  from `main` was silently rejected (`Branch "main" is not allowed to deploy to github-pages
+  due to environment protection rules`) — visible only in the failed run's own annotations, not
+  in any workflow file or doc. Fix: **Settings → Environments → github-pages → Deployment
+  branches and tags**, update to match whatever the actual default branch is. If setting up
+  fresh, get the branch name right *before* enabling Pages (see the point above) to avoid this
+  entirely.
+
+  ## Architecture
 
 Unchanged in shape from the predecessor — this pattern was validated, not broken:
 
