@@ -1,0 +1,233 @@
+name: generate-issues
+
+# M6: approve -> provision. Runs after a design doc PR merges to main (a push touching
+# docs/proposals/*.md) and opens a provisioning issue *in this repo* telling a human what
+# to run locally -- it never creates the target project's repo and never touches any repo
+# other than this one (DESIGN.md's "Architecture": repo creation stays a human step with
+# the human's own `gh auth`, precisely because repo-creation rights force broad token
+# scope, which this repo's narrowly-scoped GH_PAT deliberately does not have).
+#
+# claude-code-action does not support being triggered directly off a bare `push` event, so
+# this uses a two-job dispatch pattern: `dispatch` (push-triggered) figures out which
+# proposal doc(s) changed and re-fires this same workflow via workflow_dispatch, once per
+# doc, using the default GITHUB_TOKEN's actions:write permission. `generate` (only runs on
+# the resulting workflow_dispatch) does the actual Claude run.
+#
+# That re-dispatch matters for a second reason beyond action-trigger support: it makes the
+# triggering actor "github-actions[bot]" rather than this repo's own owner. The `generate`
+# job below deliberately authenticates as GITHUB_TOKEN (not GH_PAT) so the resulting
+# provisioning issue is opened by that genuinely different, notifying actor -- GitHub does
+# not send you a notification about your own account's actions, so an issue opened "by"
+# the repo owner's own GH_PAT identity would go unnoticed by the one person who needs to
+# see it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/proposals/*.md"
+  workflow_dispatch:
+    inputs:
+      doc_path:
+        description: "Path to the merged design doc (docs/proposals/<slug>.md)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Re-fire this workflow per changed proposal doc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          after="${{ github.event.after }}"
+          # A brand-new branch head (force-push, or the very first push touching this
+          # path) reports an all-zero `before` SHA, which is not a valid diff endpoint --
+          # fall back to comparing against the immediate parent of `after` instead.
+          if [ "$before" = "0000000000000000000000000000000000000000" ] || [ -z "$before" ]; then
+            before="${after}~1"
+          fi
+
+          changed=$(git diff --name-only --diff-filter=ACM "$before" "$after" -- 'docs/proposals/*.md' || true)
+          if [ -z "$changed" ]; then
+            echo "No proposal docs changed in this push -- nothing to dispatch."
+            exit 0
+          fi
+
+          while IFS= read -r doc; do
+            [ -n "$doc" ] || continue
+            echo "Dispatching generate-issues.yml for $doc"
+            gh workflow run generate-issues.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref main \
+              -f doc_path="$doc"
+          done <<< "$changed"
+
+  generate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve slug and check for an existing provisioning issue
+        id: cfg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          doc_path="${{ inputs.doc_path }}"
+          if [ ! -f "$doc_path" ]; then
+            echo "::error::$doc_path not found on main -- nothing to generate from."
+            exit 1
+          fi
+          echo "doc_path=$doc_path" >> "$GITHUB_OUTPUT"
+
+          slug=$(basename "$doc_path" .md)
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+          # Owner defaults to this repo's own owner -- provisioning a new project's repo
+          # happens under the same account/org that owns the factory, per DESIGN.md's
+          # "GH_PAT: token strategy" (repo creation is always a human step run with the
+          # human's own `gh auth`, not a cross-account operation this workflow performs).
+          owner="${{ github.repository_owner }}"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+          title="Provision ${owner}/${slug}"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+          # Idempotency: if this doc already produced an open provisioning issue (e.g. a
+          # re-dispatch after a transient failure, or the doc was edited again post-merge),
+          # don't open a duplicate.
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                       --search "\"$title\" in:title" --json number --jq 'length')
+          if [ "$existing" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "An open issue titled '$title' already exists -- skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record start time
+        id: timer
+        if: steps.cfg.outputs.skip != 'true'
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        id: claude
+        if: steps.cfg.outputs.skip != 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # GITHUB_TOKEN, not GH_PAT -- see the header comment above: the issue this step
+          # opens needs to be attributed to "github-actions[bot]" specifically, a distinct
+          # actor from the repo owner's own GH_PAT identity, so the owner actually gets
+          # notified of it.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # The actor that triggered this workflow_dispatch is github-actions[bot] (the
+          # `dispatch` job re-fired it using the default GITHUB_TOKEN), and
+          # claude-code-action refuses to run for a bot actor by default. Scoped to exactly
+          # that one bot identity, not a wildcard -- this workflow is only ever meant to be
+          # reached via the `dispatch` job's own re-fire, never by an arbitrary bot.
+          allowed_bots: "github-actions[bot]"
+          track_progress: false
+          base_branch: main
+          prompt: |
+            A design doc was just merged to main: `${{ steps.cfg.outputs.doc_path }}`.
+            Open one provisioning issue in this repo (never any other repo) telling a
+            human what to run locally to stand the project up.
+
+            ## Task
+
+            This is mechanical work, not a design decision -- the doc has already been
+            through human review as a PR. Model is claude-sonnet-5 deliberately, not opus:
+            there is no ambiguity left to resolve here, only parsing an already-approved
+            doc, matching it against a short fixed set of keyword patterns, and filling in
+            a template.
+
+            1. Read `${{ steps.cfg.outputs.doc_path }}`.
+            2. Infer the project type from a few keyword patterns in the doc (e.g. mentions
+               of "Nautobot" / "NAPALM" / network source-of-truth -> `nautobot-app`;
+               "NetBox" / "plugin" for NetBox -> `netbox-plugin`; anything else general
+               purpose -> `custom-script`). If genuinely unclear, default to
+               `custom-script` and say so plainly in the issue rather than guessing
+               silently.
+            3. Read `templates/<type>/` (once it exists -- an earlier milestone; if it does
+               not exist yet, say so in the issue instead of inventing placeholder names)
+               to see which `--set KEY=value` placeholders that project type's templates
+               require. Per DESIGN.md's "Lessons carried forward": `custom-script`'s
+               `ENTRY_POINT` has no defensible default and must always be supplied via
+               `--set`; `nautobot-app`/`netbox-plugin` have built-in version defaults but no
+               entry-point guess either -- call out every required `--set` explicitly
+               rather than omitting one, which is exactly the mistake the predecessor's
+               first few provisioning issues made.
+            4. Open an issue in this repo titled exactly
+               `${{ steps.cfg.outputs.title }}` with a body containing:
+               - A one-line summary of the project (from the doc).
+               - The exact `scripts/factory-new.sh` command to run, with every required
+                 `--set` placeholder filled from the doc's content (or left as an obvious
+                 `<fill-in>` marker with a note, if the doc doesn't say).
+               - A reminder to run `scripts/factory-secrets.sh` next (GH_PAT prompted
+                 interactively, never stored) and then fire the new repo's own
+                 `seed-milestones.yml`.
+               - A link back to the merged design doc PR if you can find it via `gh pr
+                 list --search`.
+
+            You are running unattended -- there is no human to answer a question mid-run,
+            so make the best call you can from the doc and flag any assumption in the
+            issue body rather than stalling.
+          claude_args: >-
+            --model claude-sonnet-5
+            --max-turns 40
+            --allowedTools "Bash(gh:*),Read,Glob,Grep"
+
+      - name: Upload execution transcript
+        if: always() && steps.cfg.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript-provision-${{ steps.cfg.outputs.slug }}-run-${{ github.run_id }}
+          path: ${{ steps.claude.outputs.execution_file }}
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Append journal entry
+        if: always() && steps.cfg.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: generate-issues.yml
+          ISSUE_NUMBER: ${{ steps.cfg.outputs.slug }}
+          ISSUE_TITLE: ${{ steps.cfg.outputs.title }}
+          MODEL: claude-sonnet-5
+          RESULT: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          START: ${{ steps.timer.outputs.start }}
+          MILESTONE: "—"
+        run: |
+          # PR_REF here refers to the merged design-doc PR, not something this run opens
+          # itself -- best-effort lookup, falls back to "—" like every other caller.
+          export PR_REF=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged \
+            --search "\"${{ steps.cfg.outputs.doc_path }}\" in:title,body" \
+            --json number --jq 'if length>0 then "#\(.[0].number)" else "—" end' 2>/dev/null || echo "—")
+          bash .github/scripts/journal-entry.sh

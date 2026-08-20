@@ -1,0 +1,152 @@
+name: CI
+
+# M7 (new in this repo -- not present in the predecessor, see DESIGN.md's
+# milestone list): fast pull-request checks over the three kinds of files
+# most likely to break silently -- site/ (build+lint+check), scripts/
+# (bash -n + executable-bit), and JSON config (labels.json and friends).
+# Each job only runs when its own paths are touched, and only what changed
+# needs to check clean.
+
+on:
+  pull_request:
+    paths:
+      - "site/**"
+      - "scripts/**"
+      - "templates/_shared/labels.json"
+      - "**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            site:
+              - 'site/**'
+
+      - if: steps.filter.outputs.site == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        if: steps.filter.outputs.site == 'true'
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          else
+            echo "site/package.json doesn't exist yet (pre-M3) -- nothing to check"
+          fi
+
+      - name: Build
+        if: steps.filter.outputs.site == 'true'
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build
+          else
+            echo "no build script yet -- skipping"
+          fi
+
+      - name: Lint
+        if: steps.filter.outputs.site == 'true'
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
+            npm run lint
+          else
+            echo "no lint script yet -- skipping"
+          fi
+
+      - name: Check (svelte-check)
+        if: steps.filter.outputs.site == 'true'
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.check' package.json >/dev/null 2>&1; then
+            npm run check
+          else
+            echo "no check script yet -- skipping"
+          fi
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            scripts:
+              - 'scripts/**'
+
+      - name: bash -n every shell script
+        if: steps.filter.outputs.scripts == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(scripts/**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no .sh files under scripts/ -- nothing to check"
+            exit 0
+          fi
+          status=0
+          for f in "${files[@]}"; do
+            echo "bash -n $f"
+            bash -n "$f" || status=1
+          done
+          exit "$status"
+        shell: bash --noprofile --norc -o pipefail {0}
+
+      - name: Verify executable bit
+        if: steps.filter.outputs.scripts == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(scripts/**/*.sh)
+          status=0
+          for f in "${files[@]}"; do
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::not executable -- chmod +x $f"
+              status=1
+            fi
+          done
+          exit "$status"
+        shell: bash --noprofile --norc -o pipefail {0}
+
+  json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            json:
+              - 'templates/_shared/labels.json'
+              - '**/*.json'
+
+      - name: jq validate every JSON file
+        if: steps.filter.outputs.json == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          status=0
+          for f in **/*.json; do
+            case "$f" in
+              */node_modules/*|node_modules/*) continue ;;
+            esac
+            echo "jq . $f"
+            jq . "$f" > /dev/null || { echo "::error file=$f::invalid JSON"; status=1; }
+          done
+          exit "$status"

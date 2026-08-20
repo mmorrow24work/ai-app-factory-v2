@@ -1,0 +1,54 @@
+# CLAUDE.md
+
+Conventions for unattended (Lane B) work on `{{PROJECT_NAME}}`.
+
+{{PROJECT_DESCRIPTION}}
+
+- **Entry point**: `{{ENTRY_POINT}}`
+- **Default branch**: `{{BASE_BRANCH}}`
+
+Use that name exactly. `main.py` is a placeholder scaffold shipped by the template -- if
+`{{ENTRY_POINT}}` differs from `main.py`, your first task on this project is renaming
+`main.py` (and updating `tests/test_main.py`, `README.md`, and this file's references to it) to
+match, before adding any functionality.
+
+## Repo map
+
+```
+{{ENTRY_POINT}}                    Main script — the thing this project does
+tests/                             Test suite for {{ENTRY_POINT}}
+theme.css, theme-toggle.js         Framework-free light/dark theme — link into any HTML page, see Conventions below
+docs/journal.md                    Per-issue build metrics, appended by the workflow only — never edit by hand
+.github/workflows/claude.yml       The Lane B driver
+.github/scripts/journal-entry.sh   Metrics-append script the workflow calls
+.env                               Local secrets — never commit, see .env.example
+```
+
+## Conventions
+
+- **Never edit `docs/journal.md` by hand or from within a PR branch.** It's appended by
+  `.github/workflows/claude.yml` *after* your PR merges, via `.github/scripts/journal-entry.sh`.
+  Editing it in your branch means every open PR touches the same file and goes conflicting the
+  moment any other PR merges.
+- **If an issue asks you to create or edit an HTML page, link `theme.css`/`theme-toggle.js` into
+  it rather than inventing your own theming or color scheme.** In `<head>`: a plain
+  `<link rel="stylesheet" href="theme.css">`, then a plain blocking
+  `<script src="theme-toggle.js"></script>` right after it -- not `defer`, not
+  `type="module"` -- so the stored theme choice applies before first paint (no flash of the
+  wrong theme). No further HTML changes are required — a toggle button is injected
+  automatically if the page doesn't already have one. Project-specific CSS can still override
+  `theme.css`'s custom properties (`--color-bg`, `--color-fg`, `--color-muted`,
+  `--color-border`, `--color-accent`, `--font-sans`) or any of its rules; it's a starting point,
+  not a constraint. Apply this to every HTML page the unattended pipeline creates in this repo,
+  not just ones an issue mentions by name.
+- Keep commit and PR scope to the files named in the issue or in the repo map above.
+- {{ADDITIONAL_CONVENTIONS}}
+
+## Definition of done
+
+- The issue's acceptance criteria are met.
+- Tests pass: `{{TEST_COMMAND}}`.
+- Any shell script added is `bash -n`-clean and executable (`chmod +x`).
+- Any JSON added is valid (`jq . <file>` succeeds).
+- PR description explains what you implemented, what you verified, and anything you could not
+  verify unattended.

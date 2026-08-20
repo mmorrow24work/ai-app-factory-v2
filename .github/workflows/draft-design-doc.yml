@@ -1,0 +1,198 @@
+name: draft-design-doc
+
+# M5: intake -> design doc. Triggers on a newly opened issue whose TITLE carries the
+# `[new-project-ask] ` prefix -- never a label filter. GitHub silently drops `labels=`
+# query params on an `issues/new` deep link for anyone who isn't already a repo
+# collaborator with label-write access, which is exactly the requester this flow exists
+# to serve (see DESIGN.md's "Lessons carried forward" -- the predecessor's first live
+# test of a label-based trigger only "worked" because it was run by the repo owner, who
+# structurally couldn't have caught the failure). Title and body query params on the
+# deep link are the only reliably-delivered signal for a non-collaborator visitor.
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  draft:
+    if: startsWith(github.event.issue.title, '[new-project-ask] ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve slug and check for an existing design PR
+        id: cfg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          raw_title="${{ github.event.issue.title }}"
+          name="${raw_title#\[new-project-ask\] }"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+          slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | \
+                   sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+          [ -n "$slug" ] || slug="ask-${{ github.event.issue.number }}"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+          # Idempotency: if a PR titled "Design: <name>" already exists (open or
+          # previously merged/closed from an earlier run against the same ask), skip
+          # re-drafting rather than opening a duplicate. Tolerate zero matches -- gh pr
+          # list returning an empty array is the common case, not an error.
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --state all \
+                       --search "\"Design: $name\" in:title" \
+                       --json number --jq 'length')
+          if [ "$existing" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "A PR titled 'Design: $name' already exists -- skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record start time
+        id: timer
+        if: steps.cfg.outputs.skip != 'true'
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        id: claude
+        if: steps.cfg.outputs.skip != 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          # Any real visitor who fills out the `/new` intake form is, by construction, not
+          # a repo collaborator -- that's the entire point of the zero-credential deep-link
+          # flow (DESIGN.md's "Intake and requester identity"). claude-code-action refuses
+          # a non-write actor by default, so this must be opened up. The blast radius stays
+          # bounded on three independent axes: (1) the token used is GH_PAT, scoped to only
+          # this one repo with Contents/Issues/Pull requests/Actions/Secrets -- never
+          # Administration or Workflows, so nothing here can touch another repo or rewrite
+          # a workflow file; (2) allowedTools below has no curl/network fetch, so the issue
+          # body is the only untrusted input Claude can act on; (3) the output is a PR, not
+          # a direct push to main -- a human still reviews and merges every design doc.
+          allowed_non_write_users: "*"
+          track_progress: false
+          base_branch: main
+          prompt: |
+            Draft a design doc for a new project, based on the intake issue below, and
+            open it as a pull request.
+
+            ## Intake issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            ## Instructions
+
+            1. Create a new branch named `design/${{ steps.cfg.outputs.slug }}` off `main`.
+            2. Write `docs/proposals/${{ steps.cfg.outputs.slug }}.md`, shaped like this
+               repo's own `DESIGN.md` (same section headings: Problem, Goal, Non-goals,
+               Architecture, Milestones, Known limitations -- adapt as the ask actually
+               needs, this is a starting draft for human review, not a final document).
+               Base the content on the intake issue's requirements above. Leave line 3 of
+               the file blank -- a separate automated step stamps a "Requested by" line
+               there after you finish; do not write that line yourself.
+            3. Commit and push the branch, then open a pull request against `main` titled
+               exactly `Design: ${{ steps.cfg.outputs.name }}`. In the PR body, explain
+               what you drafted and note that it's a starting point for review, not
+               something to merge as-is. Do not add a "Requested by" line to the PR body
+               yourself -- a separate automated step stamps that on afterward, reading the
+               intake issue's actual author, which is a signal only that step should ever
+               write, not something for you to write or invent.
+            4. Do not close or comment further on the intake issue itself; the PR is the
+               deliverable.
+
+            You are running unattended -- there is no human to answer a question mid-run,
+            so make a reasonable judgment call and note any assumption in the PR body
+            rather than stalling.
+          claude_args: >-
+            --model claude-opus-5
+            --max-turns 100
+            --allowedTools "Bash(gh:*),Bash(git:*),Edit,Read,Write,Glob,Grep"
+
+      # --- Requested-by stamp -----------------------------------------------
+      # Written by this script, never by the LLM step above: the requester's identity
+      # must be unspoofable and unskippable, not a convention the model has to remember
+      # every run. Reads the intake issue's own author.login from the event payload
+      # (GitHub-authenticated at issue-creation time), never anything the issue body or
+      # title could claim to be.
+
+      - name: Stamp requester identity
+        id: stamp
+        if: steps.cfg.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          SLUG: ${{ steps.cfg.outputs.slug }}
+          REQUESTER: ${{ github.event.issue.user.login }}
+        run: |
+          set -euo pipefail
+          branch="design/$SLUG"
+
+          pr_number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+                        --json number --jq '.[0].number // empty')
+          if [ -z "$pr_number" ]; then
+            echo "No PR found on branch $branch -- the drafting step may not have opened one. Skipping stamp."
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          git fetch -q origin "$branch"
+          git checkout -q "$branch"
+
+          doc="docs/proposals/$SLUG.md"
+          stamp_line="**Requested by:** @${REQUESTER}"
+          if [ -f "$doc" ]; then
+            # Line 3 by construction: line 1 is the "# Design: ..." heading, line 2 is
+            # blank, line 3 is where the stamp goes -- the drafting prompt above asks
+            # Claude to leave it blank for exactly this insertion.
+            awk -v stamp="$stamp_line" 'NR==3 { print stamp; next } { print }' "$doc" > "$doc.tmp"
+            mv "$doc.tmp" "$doc"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$doc"
+            if ! git diff --staged --quiet; then
+              git commit -q -m "docs(proposals): stamp requester on $SLUG"
+              git push -q origin "HEAD:$branch"
+            fi
+          else
+            echo "WARNING: $doc not found on $branch -- could not stamp the doc body."
+          fi
+
+          body=$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          printf '%s\n\n%s\n' "$stamp_line" "$body" | \
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file -
+
+      - name: Upload execution transcript
+        if: always() && steps.cfg.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcript-design-${{ steps.cfg.outputs.slug }}-run-${{ github.run_id }}
+          path: ${{ steps.claude.outputs.execution_file }}
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Append journal entry
+        if: always() && steps.cfg.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: draft-design-doc.yml
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ steps.cfg.outputs.name }}
+          MODEL: claude-opus-5
+          RESULT: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          START: ${{ steps.timer.outputs.start }}
+          MILESTONE: "—"
+          PR_REF: ${{ steps.stamp.outputs.pr_number && format('#{0}', steps.stamp.outputs.pr_number) || '—' }}
+        run: bash .github/scripts/journal-entry.sh
