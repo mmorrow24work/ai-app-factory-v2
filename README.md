@@ -63,6 +63,24 @@ gh label create lane:unattended --color 0E8A16 -R <owner>/ai-app-factory-v2
 gh label create new-project-ask --color FBCA04 -R <owner>/ai-app-factory-v2
 ```
 
+We can automate this.
+
+```sh
+read -rp "GitHub owner: " OWNER
+declare -A LABELS=(
+  ["model:opus"]="5319E7"
+  ["model:haiku"]="C5DEF5"
+  ["claude-go"]="0E8A16"
+  ["lane:interactive"]="1D76DB"
+  ["lane:manual"]="B60205"
+  ["lane:unattended"]="0E8A16"
+  ["new-project-ask"]="FBCA04"
+)
+for name in "${!LABELS[@]}"; do
+  gh label create "$name" --color "${LABELS[$name]}" -R "$OWNER/ai-app-factory-v2"
+done
+
+```
 ### 2. The local secrets store (`factory-new.sh` / `factory-secrets.sh`)
 
 ```sh
@@ -79,6 +97,12 @@ to disk. See `.env.example` and `DESIGN.md`'s "GH_PAT: token strategy" for why a
 `scripts/README.md` for the full CLI reference.
 
 ### 3. GitHub Pages, in the correct order
+
+Before any of this, confirm your local default branch is actually `main` (`git branch`) --
+every workflow in this repo assumes it, and GitHub's own Pages environment protection rule
+locks to whichever branch was default *when Pages was first configured*, not whatever it's
+renamed to later. Get the branch name right first if you can; see DESIGN.md's "Lessons learned
+standing up this repo itself" if you hit this after the fact.
 
 This order matters — doing it backwards is exactly how the predecessor's dashboard silently
 404'd for a stretch:
