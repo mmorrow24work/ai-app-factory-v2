@@ -65,6 +65,25 @@ gh label create lane:unattended --color 0E8A16 -R <owner>/ai-app-factory-v2
 gh label create new-project-ask --color FBCA04 -R <owner>/ai-app-factory-v2
 ```
 
+Or use this loop.
+
+```
+read -rp "GitHub owner: " OWNER
+declare -A LABELS=(
+  ["model:opus"]="5319E7"
+  ["model:haiku"]="C5DEF5"
+  ["claude-go"]="0E8A16"
+  ["lane:interactive"]="1D76DB"
+  ["lane:manual"]="B60205"
+  ["lane:unattended"]="0E8A16"
+  ["new-project-ask"]="FBCA04"
+)
+for name in "${!LABELS[@]}"; do
+  gh label create "$name" --color "${LABELS[$name]}" -R "$OWNER/ai-app-factory-v2"
+done
+```
+
+
 ### 2. The local secrets store (`factory-new.sh` / `factory-secrets.sh`)
 
 ```sh
