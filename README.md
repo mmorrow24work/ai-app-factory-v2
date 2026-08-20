@@ -25,8 +25,10 @@ Live dashboard (once deployed): **https://\<your-custom-domain\>** — see "Setu
 the deployment order matters.
 
 See `DESIGN.md` for the full design, `docs/adr/0001-design-to-issues-loop.md` for the ask →
-design doc → milestones/issues → `claude-go` loop step by step, and `docs/journal.md` for the
-build log of this repo's own (dogfooded) construction.
+design doc → milestones/issues → `claude-go` loop step by step, `docs/journal.md` for the
+build log of this repo's own (dogfooded) construction, and
+[`docs/cowork-sandbox-handoff.md`](docs/cowork-sandbox-handoff.md) if you're curious how a repo
+like this one gets built inside a Cowork sandbox and handed off to GitHub in the first place.
 
 ## Setup
 
@@ -63,24 +65,6 @@ gh label create lane:unattended --color 0E8A16 -R <owner>/ai-app-factory-v2
 gh label create new-project-ask --color FBCA04 -R <owner>/ai-app-factory-v2
 ```
 
-We can automate this.
-
-```sh
-read -rp "GitHub owner: " OWNER
-declare -A LABELS=(
-  ["model:opus"]="5319E7"
-  ["model:haiku"]="C5DEF5"
-  ["claude-go"]="0E8A16"
-  ["lane:interactive"]="1D76DB"
-  ["lane:manual"]="B60205"
-  ["lane:unattended"]="0E8A16"
-  ["new-project-ask"]="FBCA04"
-)
-for name in "${!LABELS[@]}"; do
-  gh label create "$name" --color "${LABELS[$name]}" -R "$OWNER/ai-app-factory-v2"
-done
-
-```
 ### 2. The local secrets store (`factory-new.sh` / `factory-secrets.sh`)
 
 ```sh
@@ -96,31 +80,7 @@ to disk. See `.env.example` and `DESIGN.md`'s "GH_PAT: token strategy" for why a
 `.env` is gitignored — lives inside this checkout, but git can never touch it. See
 `scripts/README.md` for the full CLI reference.
 
-### 3. GitHub Pages, in the correct order
-
-Before any of this, confirm your local default branch is actually `main` (`git branch`) --
-every workflow in this repo assumes it, and GitHub's own Pages environment protection rule
-locks to whichever branch was default *when Pages was first configured*, not whatever it's
-renamed to later. Get the branch name right first if you can; see DESIGN.md's "Lessons learned
-standing up this repo itself" if you hit this after the fact.
-
-This order matters — doing it backwards is exactly how the predecessor's dashboard silently
-404'd for a stretch:
-
-1. **Repo Settings → Pages → Build and deployment → Source: "GitHub Actions."** Not "Deploy
-   from a branch" (GitHub's default when Pages is first enabled) — this repo deploys via
-   `pages-deploy.yml`'s `actions/deploy-pages`, which only publishes anything if Source is set
-   to read from Actions deployments. Leaving it on the branch-based default means the workflow
-   can run green forever while nothing is actually served.
-2. **If using a custom domain**, add it under Settings → Pages → Custom domain *after* step 1,
-   and confirm `site/svelte.config.js`'s `base: ''` still matches (it assumes a domain-root
-   deploy from the start — see `DESIGN.md`). If you're deploying to the plain
-   `<owner>.github.io/<repo>/` project-pages URL instead, that line needs to become the repo
-   name as a subpath (`base: '/ai-app-factory-v2'`), or every built asset URL will be wrong.
-3. Push anything touching `site/**` (or run `gh workflow run pages-deploy.yml`) to trigger the
-   first real deploy.
-
-### 4. Running the site locally
+### 3. Running the site locally
 
 ```sh
 cd site
@@ -137,6 +97,62 @@ typography), stored in `localStorage`. `/new` builds a pre-filled GitHub "New is
 hands off to GitHub's own submit button — no authenticated API call from the browser, ever
 (see `DESIGN.md`'s "Lessons carried forward" for why this repo starts here instead of a
 PAT-in-`localStorage` design).
+
+### 4. Running the site on GitHub, with a custom domain (Cloudflare example)
+
+If you're working from a normal `git clone` or fork of this repo, `main` is already the
+correct default branch and none of the branch-naming caveats in `DESIGN.md`'s "Provenance"
+section apply to you — skip straight to step 1 below. That section exists to explain a
+one-time detour in how the *first* copy of this repo got onto GitHub, not a routine setup step.
+
+Order matters for what follows — doing it backwards is exactly how this dashboard silently
+404'd for a stretch the first time it was set up:
+
+**1. Repo Settings → Pages → Build and deployment → Source: "GitHub Actions."** Not "Deploy
+from a branch" (GitHub's default when Pages is first enabled) — this repo deploys via
+`pages-deploy.yml`'s `actions/deploy-pages`, which only publishes anything if Source reads from
+Actions deployments. Leaving it on the branch-based default means the workflow can run green
+forever while nothing is actually served.
+
+**2. Repo Settings → Pages → Custom domain:** enter your domain (e.g.
+`ai-app-factory-v2.yourdomain.com`) and save. GitHub will show "DNS check unsuccessful" until
+step 3 is done — expected at this point, not an error. Confirm `site/svelte.config.js`'s
+`base: ''` still matches this (it assumes a domain-root deploy — see `DESIGN.md`). If you're
+deploying to the plain `<owner>.github.io/<repo>/` project-pages URL instead of a custom
+domain, that line needs to become the repo name as a subpath
+(`base: '/ai-app-factory-v2'`), or every built asset URL will be wrong.
+
+**3. Add the DNS record at Cloudflare** (or whichever registrar/DNS host you use):
+
+| Type  | Name                | Target                | Proxy status |
+|-------|---------------------|------------------------|--------------|
+| CNAME | `ai-app-factory-v2` | `<owner>.github.io`   | DNS only     |
+
+"DNS only" (grey cloud, not orange) is the simpler starting point — a Cloudflare-proxied
+(orange cloud) record works too, but adds a layer between you and GitHub's own HTTPS
+certificate provisioning that's one more thing to debug if something looks wrong. Switch to
+proxied later once you've confirmed the direct path works. DNS propagation and GitHub's
+certificate issuance can both take a few minutes.
+
+**4. Trigger the first real deploy** (it may already have fired automatically if step 1 was
+done before any push touching `site/**`):
+
+```sh
+gh run list -R <owner>/<repo> --workflow=pages-deploy.yml --limit 3
+# if nothing recent, or you want to force a fresh one:
+gh workflow run pages-deploy.yml -R <owner>/<repo>
+```
+
+**5. Verify independent of DNS/CDN caching:**
+
+```sh
+gh api repos/<owner>/<repo>/pages
+```
+
+Check `status` (should be `built`) and `https_certificate.state` (should be `approved`). A
+`curl -I https://<your-domain>/` can lag behind this by several minutes even after a successful
+deploy, since GitHub's edge caches negative (404) responses — don't treat a stale `curl` result
+as a live problem if `gh api .../pages` already looks correct.
 
 ## Using the factory
 
