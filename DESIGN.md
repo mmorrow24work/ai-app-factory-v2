@@ -204,31 +204,7 @@ the start instead of left to be rediscovered a second time.
   (`templates/custom-script/theme.css` + `theme-toggle.js`) exist from the first version of
   the relevant templates, rather than being adopted mid-build from a sibling project.
 
-## Lessons learned standing up this repo itself
-
-Found during the actual first deploy of `ai-app-factory-v2` (not inherited from the
-predecessor — genuinely new):
-
-- **The local default branch name is not guaranteed to be `main`.** Every workflow here
-  hardcodes `main` (`pages-deploy.yml`'s `branches: [main]`, `base_branch: main` in
-  `claude.yml`/`draft-design-doc.yml`/`generate-issues.yml`), but a fresh `git init` only
-  defaults to `main` if `git config init.defaultBranch` is set that way — older git versions,
-  and plenty of default shell environments, still default to `master`. Verify with
-  `git branch` before the first push; rename with `git branch -m master main` if needed,
-  *before* pushing, so GitHub's default branch is `main` from the first commit rather than
-  needing a rename (and the environment-protection fix below) after the fact.
-- **GitHub's auto-created `github-pages` deployment environment locks deployment to whatever
-  the default branch was *at the time Pages was first configured*, and does not auto-update
-  if the default branch is renamed afterward.** Renaming `master` → `main` post-hoc left the
-  environment's "Deployment branches and tags" rule still pointed at `master`, so every deploy
-  from `main` was silently rejected (`Branch "main" is not allowed to deploy to github-pages
-  due to environment protection rules`) — visible only in the failed run's own annotations, not
-  in any workflow file or doc. Fix: **Settings → Environments → github-pages → Deployment
-  branches and tags**, update to match whatever the actual default branch is. If setting up
-  fresh, get the branch name right *before* enabling Pages (see the point above) to avoid this
-  entirely.
-
-  ## Architecture
+## Architecture
 
 Unchanged in shape from the predecessor — this pattern was validated, not broken:
 
@@ -274,6 +250,66 @@ matters; not reproduced verbatim here to keep this doc from becoming a copy of t
   a smoke-test dry run, `templates/_shared/labels.json` JSON validation) and Dependabot for
   `site/`'s npm deps — both addressed here at M7 rather than deferred, since they're cheap
   relative to the rest of this rebuild and the predecessor's own backlog flagged both as gaps.
+
+## Provenance: how this repo was first stood up
+
+**If you're reading this because you cloned or forked `ai-app-factory-v2` from GitHub, this
+section doesn't apply to you and you can skip it.** `main` is this repo's actual default
+branch, and everything below describes a one-time detour in how the *first* copy of this repo
+got from nowhere to existing on GitHub at all — not anything a normal `git clone`/`gh repo
+fork` will reproduce.
+
+This repo was built inside a Cowork sandbox session — an ephemeral cloud container with no
+standing GitHub credential of its own, so it cannot push a brand-new repo into existence
+directly (see [`docs/cowork-sandbox-handoff.md`](docs/cowork-sandbox-handoff.md) for the full
+explanation of why, and the bundle-vs-archive tradeoff generally). The whole repo was instead
+packaged as a portable `git bundle` and handed to a human, who cloned it locally and pushed it
+to a newly created GitHub repo:
+
+```sh
+git clone <bundle-file> ~/git/ai-app-factory-v2
+cd ~/git/ai-app-factory-v2 && git log
+gh repo create ai-app-factory-v2 --public --source=. --remote=origin --push
+git remote -v
+git remote set-url origin https://github.com/<owner>/ai-app-factory-v2.git && git push -u origin main
+git branch
+git push -u origin master
+git branch -m master main && git push -u origin main
+```
+
+### What went wrong, once
+
+- **The sandbox's own `git init` had no `init.defaultBranch` override, so it fell back to
+  git's real built-in default, `master`** — while every workflow file here (`pages-deploy.yml`,
+  `claude.yml`, `draft-design-doc.yml`, `generate-issues.yml`) hardcodes `main`. The bundle
+  faithfully preserved that `master`-named branch, so the first push attempt against `main`
+  failed outright (`git branch` showed `master`, not `main`), and it took a rename-then-push to
+  fix. `git init -b main` at the very start — inside the sandbox, before the bundle was even
+  created — would have avoided this entirely; that's the actual fix, not anything inherent to
+  building a repo this way.
+- **GitHub's auto-created `github-pages` deployment environment locked to `master`** (the
+  default branch at the moment Pages was first enabled) and did not follow the later rename to
+  `main`, so every deploy from `main` was rejected until the environment's branch policy was
+  updated to match:
+  ```sh
+  echo '{"deployment_branch_policy": null}' | \
+    gh api -X PUT repos/<owner>/<repo>/environments/github-pages --input -
+  ```
+
+Both are now fixed at the GitHub-repo-settings level (not in git history), and this repo's
+commit history has since been squashed to a single clean commit on `main` — so nothing about
+this detour persists in what a normal clone or fork actually sees.
+
+**If you're building a similar factory repo from scratch yourself** (not cloning this one) —
+by hand, or via a future rebuild pass the way this repo itself was built — the one thing worth
+carrying forward is: run `git init -b main` explicitly, don't rely on your environment's
+default matching what your workflows assume, and check `git branch` *before* enabling GitHub
+Pages rather than after.
+
+A copy of the original hand-off archive, `ai-app-factory-v2.tar.gz`, is kept in this repo (see
+[`artifacts/`](artifacts/) or this repo's Releases) for anyone who wants to reproduce this
+exact detour deliberately — unpack it fresh and run a bare `git init` (no `-b main`) to watch
+the same branch-default mismatch happen live, rather than just reading about it here.
 
 ## Known limitations (carried forward, still true here)
 
